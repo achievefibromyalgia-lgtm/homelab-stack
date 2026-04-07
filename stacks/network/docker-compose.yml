@@ -1,6 +1,9 @@
 services:
+  # ===========================================================================
+  # AdGuard Home — DNS filter + ad blocking
+  # ===========================================================================
   adguardhome:
-    image: adguard/adguardhome:v0.107.55
+    image: adguard/adguardhome:v0.107.52
     container_name: adguardhome
     restart: unless-stopped
     networks:
@@ -9,11 +12,13 @@ services:
       - adguard-work:/opt/adguardhome/work
       - adguard-conf:/opt/adguardhome/conf
     ports:
-      - 53:53/tcp
-      - 53:53/udp
+      - "53:53/tcp"
+      - "53:53/udp"
+      - "784:53/udp"   # alternative DNS
+      - "3080:3000/tcp"  # AdGuard web UI
     labels:
       - traefik.enable=true
-      - traefik.http.routers.adguard.rule=Host()
+      - traefik.http.routers.adguard.rule=Host(`adguard.${DOMAIN}`)
       - traefik.http.routers.adguard.entrypoints=websecure
       - traefik.http.routers.adguard.tls=true
       - traefik.http.services.adguard.loadbalancer.server.port=3000
@@ -23,34 +28,87 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
-  nginx-proxy-manager:
-    image: jc21/nginx-proxy-manager:2.11.3
-    container_name: nginx-proxy-manager
+
+  # ===========================================================================
+  # Unbound — local recursive DNS resolver
+  # ===========================================================================
+  unbound:
+    image: mvance/unbound:1.21.1
+    container_name: unbound
     restart: unless-stopped
     networks:
       - proxy
     volumes:
-      - npm-data:/data
-      - npm-letsencrypt:/etc/letsencrypt
+      - ./config/unbound/unbound.conf:/opt/unbound/etc/unbound/unbound.conf:ro
     ports:
-      - 8181:81
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.npm.rule=Host()
-      - traefik.http.routers.npm.entrypoints=websecure
-      - traefik.http.routers.npm.tls=true
-      - traefik.http.services.npm.loadbalancer.server.port=81
+      - "5053:53/udp"
     healthcheck:
-      test: [CMD-SHELL, wget -q --spider http://localhost:3000/api/health || exit 0]
+      test: [CMD-SHELL, "unbound-control status"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
+
+  # ===========================================================================
+  # WireGuard Easy — VPN with web UI
+  # ===========================================================================
+  wg-easy:
+    image: ghcr.io/wg-easy/wg-easy:14
+    container_name: wg-easy
+    restart: unless-stopped
+    networks:
+      - proxy
+    environment:
+      - WG_HOST=${WG_HOST}
+      - WG_PORT=51820
+      - WG_DEFAULT_ADDRESS=10.8.0.x
+      - WG_DEFAULT_DNS=10.8.0.1
+      - WG_ALLOWEDICES=0.0.0.0/0
+      - WG_PERSISTENT_KEEPALIVE=25
+      - WG_CREATE_FROM_LAST_UNUSED=true
+    volumes:
+      - wg-data:/etc/wireguard
+    ports:
+      - "51820:51820/udp"
+      - "51821:51821/tcp"  # Web UI
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.wireguard.rule=Host(`wireguard.${DOMAIN}`)
+      - traefik.http.routers.wireguard.entrypoints=websecure
+      - traefik.http.routers.wireguard.tls=true
+      - traefik.http.services.wireguard.loadbalancer.server.port=51821
+
+  # ===========================================================================
+  # Cloudflare DDNS — dynamic DNS updater
+  # ===========================================================================
+  cloudflare-ddns:
+    image: ghcr.io/favonia/cloudflare-ddns:1.14.0
+    container_name: cloudflare-ddns
+    restart: unless-stopped
+    networks:
+      - proxy
+    environment:
+      - CF_API_TOKEN=${CF_API_TOKEN}
+      - CF_ZONE=${CF_ZONE}
+      - CF_RECORD=${CF_RECORD}
+      - CF_PROXIED=true
+      - UPDATE_INTERVAL=300
+    healthcheck:
+      test: [CMD, echo, "OK"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+
 networks:
   proxy:
     external: true
+
 volumes:
   adguard-work:
   adguard-conf:
-  npm-data:
-  npm-letsencrypt:
+  wg-data:
