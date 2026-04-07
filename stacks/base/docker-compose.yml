@@ -1,7 +1,7 @@
 # =============================================================================
 # HomeLab Stack — Base Infrastructure
 # Services: Traefik (reverse proxy) + Portainer (container management)
-#           + Watchtower (auto-updates)
+#           + Watchtower (auto-updates) + docker-socket-proxy (security)
 #
 # Prerequisites:
 #   1. cp .env.example .env && fill in required values
@@ -36,14 +36,11 @@ services:
       - ../../config/traefik/acme.json:/acme.json
       - traefik-logs:/var/log/traefik
     labels:
-      # Enable Traefik for this container
       - "traefik.enable=true"
-      # Router: HTTPS dashboard
       - "traefik.http.routers.traefik-dashboard.rule=Host(`traefik.${DOMAIN}`)"
       - "traefik.http.routers.traefik-dashboard.entrypoints=websecure"
       - "traefik.http.routers.traefik-dashboard.tls.certresolver=letsencrypt"
       - "traefik.http.routers.traefik-dashboard.service=api@internal"
-      # Protect dashboard with BasicAuth
       - "traefik.http.routers.traefik-dashboard.middlewares=traefik-auth@file,security-headers@file"
     healthcheck:
       test: ["CMD", "traefik", "healthcheck", "--ping"]
@@ -84,7 +81,7 @@ services:
   # ---------------------------------------------------------------------------
   # Watchtower — Automatic Container Updates
   # Checks for image updates daily at 4:00 AM
-  # Notifications sent via configured notifier (see .env)
+  # Only updates containers with com.centurylinklabs.watchtower.enable=true
   # ---------------------------------------------------------------------------
   watchtower:
     image: containrrr/watchtower:1.7.1
@@ -98,8 +95,9 @@ services:
       - WATCHTOWER_INCLUDE_RESTARTING=true
       - WATCHTOWER_SCHEDULE=0 0 4 * * *
       - WATCHTOWER_TIMEOUT=60s
-      - WATCHTOWER_NOTIFICATIONS_LEVEL=warn
-      # Scope: only update containers with this label
+      - WATCHTOWER_NOTIFICATIONS_LEVEL=info
+      - WATCHTOWER_NOTIFICATION_URL=${WATCHTOWER_NOTIFICATION_URL:-}
+      - WATCHTOWER_NOTIFICATION_TYPE=form
       - WATCHTOWER_LABEL_ENABLE=true
       - DOCKER_API_VERSION=1.44
     volumes:
@@ -111,6 +109,34 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+
+  # ---------------------------------------------------------------------------
+  # docker-socket-proxy — Secure Docker Socket Access
+  # Traefik uses this instead of direct socket access for better security.
+  # Only exposes: containers, images, volumes (no secrets, no configs)
+  # ---------------------------------------------------------------------------
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.2.0
+    container_name: docker-socket-proxy
+    restart: unless-stopped
+    networks:
+      - proxy
+    environment:
+      - CONTAINERS=1
+      - IMAGES=1
+      - VOLUMES=1
+      - INFO=1
+      - VERSION=1
+      - NETWORKS=1
+    privileged: true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -x docker-socket || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
 # =============================================================================
 # Networks
