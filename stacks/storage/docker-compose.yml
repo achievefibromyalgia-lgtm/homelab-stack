@@ -1,6 +1,6 @@
 services:
   nextcloud:
-    image: nextcloud:29.0.9-apache
+    image: nextcloud:29.0.7-fpm-alpine
     container_name: nextcloud
     restart: unless-stopped
     networks:
@@ -8,16 +8,25 @@ services:
       - databases
     volumes:
       - nextcloud-data:/var/www/html
+      - ./config/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - nextcloud-db
     environment:
-      - TZ=${TZ:-Asia/Shanghai}
-      - NEXTCLOUD_ADMIN_USER=${NEXTCLOUD_ADMIN_USER:-admin}
-      - NEXTCLOUD_ADMIN_PASSWORD=${NEXTCLOUD_ADMIN_PASSWORD:-changeme}
+      - TZ=Asia/Singapore
+      - NEXTCLOUD_ADMIN_USER=${NEXTCLOUD_ADMIN_USER}
+      - NEXTCLOUD_ADMIN_PASSWORD=${NEXTCLOUD_ADMIN_PASSWORD}
       - NEXTCLOUD_TRUSTED_DOMAINS=nextcloud.${DOMAIN}
-      - POSTGRES_HOST=homelab-postgres
+      - POSTGRES_HOST=nextcloud-db
       - POSTGRES_DB=nextcloud
-      - POSTGRES_USER=${POSTGRES_USER:-homelab}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme}
-      - REDIS_HOST=homelab-redis
+      - POSTGRES_USER=nextcloud
+      - POSTGRES_PASSWORD=${NEXTCLOUD_DB_PASSWORD}
+      - REDIS_HOST=nextcloud-redis
+    healthcheck:
+      test: [CMD-SHELL, "curl -sf http://localhost:80/status.php || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
     labels:
       - traefik.enable=true
       - "traefik.http.routers.nextcloud.rule=Host(`nextcloud.${DOMAIN}`)"
@@ -27,15 +36,58 @@ services:
       - "traefik.http.middlewares.nextcloud-dav.redirectregex.regex=https://(.*)/.well-known/(card|cal)dav"
       - "traefik.http.middlewares.nextcloud-dav.redirectregex.replacement=https://$${1}/remote.php/dav/"
       - traefik.http.routers.nextcloud.middlewares=nextcloud-dav
+
+  nextcloud-nginx:
+    image: nginx:1.27-alpine
+    container_name: nextcloud-nginx
+    restart: unless-stopped
+    networks:
+      - proxy
+    volumes:
+      - nextcloud-data:/var/www/html:ro
+      - ./config/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - nextcloud
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.nextcloud.rule=Host(`nextcloud.${DOMAIN}`)"
+      - traefik.http.routers.nextcloud.entrypoints=websecure
+      - traefik.http.routers.nextcloud.tls=true
+      - traefik.http.services.nextcloud.loadbalancer.server.port=80
+
+  nextcloud-db:
+    image: postgres:16-alpine
+    container_name: nextcloud-db
+    restart: unless-stopped
+    networks:
+      - databases
+    volumes:
+      - nextcloud-db-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=nextcloud
+      - POSTGRES_USER=nextcloud
+      - POSTGRES_PASSWORD=${NEXTCLOUD_DB_PASSWORD}
     healthcheck:
-      test: [CMD-SHELL, "curl -sf http://localhost:80/status.php || exit 1"]
+      test: [CMD-SHELL, "pg_isready -U nextcloud"]
       interval: 30s
       timeout: 10s
-      retries: 5
-      start_period: 120s
+      retries: 3
+
+  nextcloud-redis:
+    image: redis:7-alpine
+    container_name: nextcloud-redis
+    restart: unless-stopped
+    networks:
+      - databases
+    command: redis-server --save 60 1 --loglevel warning
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   minio:
-    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+    image: minio/minio:RELEASE.2024-09-22T00-33-43Z
     container_name: minio
     restart: unless-stopped
     networks:
@@ -54,6 +106,7 @@ services:
       - traefik.http.routers.minio.tls=true
       - traefik.http.services.minio.loadbalancer.server.port=9001
       - "traefik.http.routers.minio-api.rule=Host(`s3.${DOMAIN}`)"
+      - "traefik.http.routers.minio-api.rule=Host(`s3.${DOMAIN}`)"
       - traefik.http.routers.minio-api.entrypoints=websecure
       - traefik.http.routers.minio-api.tls=true
       - traefik.http.services.minio-api.loadbalancer.server.port=9000
@@ -64,8 +117,28 @@ services:
       retries: 3
       start_period: 30s
 
+  mc-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    networks:
+      - proxy
+    volumes:
+      - minio-data:/data
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-changeme-minio}
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD || true;
+      mc mb local/buckets --ignore-existing || true;
+      mc anonymous set download local/buckets || true;
+      exit 0;"
+    depends_on:
+      - minio
+
   filebrowser:
-    image: filebrowser/filebrowser:v2.31.2
+    image: filebrowser/filebrowser:v2.31.1
     container_name: filebrowser
     restart: unless-stopped
     networks:
@@ -74,7 +147,8 @@ services:
       - filebrowser-data:/database
       - ${STORAGE_PATH:-/data}:/srv
     environment:
-      - TZ=${TZ:-Asia/Shanghai}
+      - TZ=Asia/Singapore
+      - FB_BASEURL=
     labels:
       - traefik.enable=true
       - "traefik.http.routers.filebrowser.rule=Host(`files.${DOMAIN}`)"
@@ -88,13 +162,42 @@ services:
       retries: 3
       start_period: 15s
 
+  syncthing:
+    image: lscr.io/linuxserver/syncthing:1.27.11
+    container_name: syncthing
+    restart: unless-stopped
+    networks:
+      - proxy
+    volumes:
+      - syncthing-config:/config
+      - syncthing-data:/data
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Singapore
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.syncthing.rule=Host(`sync.${DOMAIN}`)"
+      - traefik.http.routers.syncthing.entrypoints=websecure
+      - traefik.http.routers.syncthing.tls=true
+      - traefik.http.services.syncthing.loadbalancer.server.port=8384
+    healthcheck:
+      test: [CMD-SHELL, "curl -sf http://localhost:8384/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
 networks:
   proxy:
     external: true
   databases:
-    external: true
+    external: false
 
 volumes:
   nextcloud-data:
+  nextcloud-db-data:
   minio-data:
   filebrowser-data:
+  syncthing-config:
+  syncthing-data:
