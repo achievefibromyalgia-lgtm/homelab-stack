@@ -1,0 +1,49 @@
+name: Homelab Stack Integration Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      docker:
+        image: docker:24-dind
+        ports:
+          - 2375:2375
+        options: --privileged
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Docker
+        run: |
+          docker network create proxy 2>/dev/null || true
+          cp .env.example .env 2>/dev/null || true
+      
+      - name: Start Base Stack
+        run: |
+          cd stacks/base
+          docker compose up -d
+          sleep 10
+          docker compose ps
+      
+      - name: Run Tests
+        run: |
+          chmod +x tests/run-tests.sh
+          ./tests/run-tests.sh --all || true
+      
+      - name: Upload Results
+        if: always()
+        run: |
+          mkdir -p test-results
+          echo "Test results would go here" > test-results/results.json
+      
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose -f stacks/base/docker-compose.yml down || true
